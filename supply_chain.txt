@@ -1,0 +1,164 @@
+create index on :SupplyChain(id);
+create index on :Stage(name);
+create index on :Stage(betweenness);
+create index on :SIC(code);
+create index on :Company(id);
+create index on :StageClassification(name);
+
+// Import dataset
+load csv with headers from "https://docs.google.com/spreadsheets/u/0/d/1vD4UCxsincEQYQpAeCbEqnd3QFdKcuL4ukesbyu5RIc/export?format=csv&id=1vD4UCxsincEQYQpAeCbEqnd3QFdKcuL4ukesbyu5RIc&gid=0" as csv
+merge (sic:SIC {code: toInt(csv.SIC_Code), desc: csv.SIC_Description})
+merge (c:Company {id: toInt(csv.companyId)})
+merge (ch:SupplyChain {id: toInt(csv.chainId)})
+merge (c)-[:HAS_SIC]->(sic)
+create (c)-[:HAS_CHAIN]->(ch);
+
+load csv with headers from
+"https://docs.google.com/spreadsheets/u/0/d/1vD4UCxsincEQYQpAeCbEqnd3QFdKcuL4ukesbyu5RIc/export?format=csv&id=1vD4UCxsincEQYQpAeCbEqnd3QFdKcuL4ukesbyu5RIc&gid=1371172744" as csv
+merge (ss:Stage {name: csv.sourceStage, chainId: toInt(csv.chainId)})
+merge (ds:Stage {name: csv.destinationStage, chainId: toInt(csv.chainId)})
+create (ss)-[:PRECEDES]->(ds);
+
+// Create STARTS_WITH relationships
+load csv with headers from
+"https://docs.google.com/spreadsheets/u/0/d/1vD4UCxsincEQYQpAeCbEqnd3QFdKcuL4ukesbyu5RIc/export?format=csv&id=1vD4UCxsincEQYQpAeCbEqnd3QFdKcuL4ukesbyu5RIc&gid=1371172744" as csv
+match (sc:SupplyChain {id: toInt(csv.chainId)}), (ss:Stage {name: csv.sourceStage, chainId: toInt(csv.chainId)})
+where not (()-[:PRECEDES]->(ss))
+AND sc.id = ss.chainId
+merge (sc)-[:STARTS_WITH]->(ss);
+
+// Create ENDS relationships
+match path = (sc:SupplyChain)-[:STARTS_WITH]->(startstage:Stage)-[:PRECEDES*]->(endstage:Stage)
+where not ((endstage)-[:PRECEDES]->())
+merge (sc)<-[:ENDS]-(endstage);
+
+// Stages include -
+// Dist_ : distributer
+// Manuf_ : manufacturer
+// Part_ : procurer
+// Parts_ : multiple procurer
+// Retail_ : retailer 
+// Trans_ : transporter
+
+// Import each Stage details
+load csv with headers from
+"https://docs.google.com/spreadsheets/u/0/d/1vD4UCxsincEQYQpAeCbEqnd3QFdKcuL4ukesbyu5RIc/export?format=csv&id=1vD4UCxsincEQYQpAeCbEqnd3QFdKcuL4ukesbyu5RIc&gid=579862779" as csv
+match (s:Stage {chainId: toInt(csv.chainId), name: csv.Stage_Name})
+set s.stageCost = toFloat(csv.stageCost)
+set s.relDepth = toInteger(csv.relDepth)
+set s.stageClassification = csv.stageClassification
+set s.avgDemand = csv.avgDemand
+set s.stdDevDemand = csv.stdDevDemand
+set s.maxServiceTime	= csv.maxServiceTime
+set s.serviceLevel = csv.serviceLevel
+set s.stageTime = toFloat(csv.stageTime)
+set s.stdDev_stageTime = csv.stdDev_stageTime;
+
+match (s:Stage)
+merge (sc:StageClassification {name: s.stageClassification})
+create (s)-[:IS_A]->(sc);
+
+// Merge "Part" and "Parts" Stages
+match (sc1:StageClassification {name:"Parts"}), (sc2:StageClassification {name:"Part"})
+WITH head(collect([sc1,sc2])) as nodes
+CALL apoc.refactor.mergeNodes(nodes,{properties:"combine", mergeRels:true}) yield node
+set node.name = "Parts"
+return count(node);
+
+// Visualize the imported dataset
+match (n)-[r]->(m)
+return distinct labels(n), type(r), labels(m);
+call db.schema.visualization;
+
+match (n) return distinct labels(n), count(*);
+match (n)-[r]->() return distinct type(r), count(*);
+match p= (sc:SupplyChain)<-[:HAS_CHAIN]-(c:Company)-[HAS_SIC]->(s:SIC) 
+return p limit 25;
+match (sc:SupplyChain {id:1})-[*..3]-(conn) return sc, conn limit 10;
+
+// Calculate depth of the network created
+match path = ((sc:SupplyChain)-[:STARTS_WITH|PRECEDES*]->(s:Stage))
+where not ((s)-[:PRECEDES]->())
+return  distinct sc.id, (max(length(path))-1) as maxlength
+order by maxlength desc;
+
+// Count number of start and end nodes
+match (s1:Stage)<-[start:STARTS_WITH]-(sc:SupplyChain)
+with sc, count(start) as starts
+match (sc)<-[end:ENDS]-(s2)
+return sc.id, starts, count(end);
+
+// Count number of endstages for chain
+match path = (:SupplyChain {id:12})-[:STARTS_WITH]->(startstage:Stage)-[:PRECEDES*]->(endstage:Stage)
+where not ((endstage)-[:PRECEDES]->())
+with distinct endstage
+return count(endstage);
+
+match path = (:SupplyChain {id:20})-[:STARTS_WITH]->(startstage:Stage)-[:PRECEDES*]->(endstage:Stage)
+where not ((endstage)-[:PRECEDES]->())
+return distinct count(path), length(path);
+
+// Visualize different available paths for a particular node 
+match path = (:SupplyChain {id:20})-[:STARTS_WITH]->(startstage:Stage)-[:PRECEDES*]->(endstage:Stage)
+where not ((endstage)-[:PRECEDES]->())
+return path;
+
+// Find the cost of paths
+match (sc:SupplyChain {id:8})-[:STARTS_WITH]->(startstage:Stage)
+with startstage,sc
+match path = (startstage)-[:PRECEDES*]->(endstage:Stage)
+where (endstage)-[:ENDS]->(sc)
+with path, reduce(sum=0, x in nodes(path) | sum+x.stageTime) as totalTime,
+reduce(sum=0, y in nodes(path) | sum+y.stageCost) as totalCost
+return totalTime, totalCost, [x in nodes(path) | id(x)]
+order by totalTime asc
+limit 10;
+
+// Calculate betweenness scores 
+:param label => ("Stage");
+:param relationshipType => ("PRECEDES");
+:param limit => (100);
+:param config => ({concurrency: 8, direction: "Outgoing", writeProperty: "betweenness"});
+CALL algo.betweenness($label, $relationshipType, $config);
+MATCH (node:Stage)
+WHERE not(node[$config.writeProperty] is null)
+RETURN node, node[$config.writeProperty] AS score
+ORDER BY score DESC
+LIMIT $limit;
+
+MATCH (s:Stage)
+WITH s
+ORDER BY s.betweenness DESC
+LIMIT 1
+SET s:BETWEENNESSCHAMP
+WITH s
+MATCH path = ((sc:SupplyChain)-[:STARTS_WITH|PRECEDES|ENDS*]->(s))
+where s in nodes(path)
+with sc,s
+limit 1
+match path = (sc)-[:STARTS_WITH]->(startstage:Stage)-[:PRECEDES*]->(endstage:Stage)-[:ENDS]->(sc)
+return path, s
+limit 100;
+
+// Find nodes with highest betweenness in a particular chain
+MATCH path = ((sc:SupplyChain {id:19})-[:STARTS_WITH|PRECEDES*]->(s))
+where s in nodes(path)
+with sc,s
+match (s)
+with s,sc
+order by s.betweenness DESC
+limit 1
+set s:BETWEENNESSCHAMP
+with s, sc
+match path = (sc)-[:STARTS_WITH]->(startstage:Stage)-[:PRECEDES*]->(endstage:Stage)-[:ENDS]->(sc)
+return path, s
+limit 100
+
+// Rearrange nodes in decreasing order of their betweenness scores 
+MATCH path = ((sc:SupplyChain {id:19})-[:STARTS_WITH|PRECEDES|ENDS*]->(s))
+where s in nodes(path)
+with sc,s
+match (s)
+return distinct s.name, apoc.node.degree(s) as degree, s.betweenness as betweenness
+order by betweenness DESC
+limit 10
